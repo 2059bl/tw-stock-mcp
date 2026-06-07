@@ -8,6 +8,7 @@
 """
 
 import json
+import re
 import time
 import urllib.request
 from datetime import datetime, timedelta
@@ -35,6 +36,35 @@ OTC_STOCKS = {
     "6669",  # 立積
     "3362",  # 瑞智
 }
+
+COMMON_STOCK_ALIASES = {
+    "台積電": "2330",
+    "鴻海": "2317",
+    "聯發科": "2454",
+    "中鋼": "2002",
+    "精金": "3049",
+    "劍湖山": "5701",
+    "迎輝": "3523",
+}
+
+
+def normalize_stock_id(stock_id: str) -> str:
+    """接受股票代碼、帶後綴代碼，或含中文股票名的短句。"""
+    text = str(stock_id).strip().upper()
+
+    for name, code in COMMON_STOCK_ALIASES.items():
+        if name in text:
+            return code
+
+    match = re.search(r"\d{4}", text)
+    if match:
+        return match.group(0)
+
+    return (
+        text.replace(".TWO", "")
+        .replace(".TW", "")
+        .replace(" ", "")
+    )
 
 
 def is_otc(stock_id: str) -> bool:
@@ -103,14 +133,17 @@ def fetch_twse(stock_id: str, days: int) -> list:
 
 
 # ========================================
-# Yahoo Finance 上櫃股查詢
+# Yahoo Finance 台股查詢
 # ========================================
-def fetch_yahoo(stock_id: str, days: int) -> list:
+def fetch_yahoo(stock_id: str, days: int, suffix: str = "TWO") -> list:
     """
-    從 Yahoo Finance 拉取上櫃股日線數據
-    上櫃股代碼要加 .TWO 後綴
+    從 Yahoo Finance 拉取台股日線數據。
+
+    suffix:
+    - TWO: 上櫃股
+    - TW: 上市股備援
     """
-    ticker = f"{stock_id}.TWO"
+    ticker = f"{stock_id}.{suffix}"
     end_ts = int(datetime.now().timestamp())
     start_ts = int((datetime.now() - timedelta(days=days + 15)).timestamp())
 
@@ -127,11 +160,23 @@ def fetch_yahoo(stock_id: str, days: int) -> list:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        raise Exception(f"Yahoo Finance 查詢失敗: {e}")
+        raise Exception(f"Yahoo Finance {ticker} 查詢失敗: {e}")
 
-    result = data["chart"]["result"][0]
-    timestamps = result["timestamp"]
-    quotes = result["indicators"]["quote"][0]
+    chart = data.get("chart", {})
+    if chart.get("error"):
+        raise Exception(f"Yahoo Finance {ticker} 回傳錯誤: {chart['error']}")
+
+    chart_results = chart.get("result") or []
+    if not chart_results:
+        return []
+
+    result = chart_results[0]
+    timestamps = result.get("timestamp") or []
+    quotes_list = result.get("indicators", {}).get("quote") or []
+    if not timestamps or not quotes_list:
+        return []
+
+    quotes = quotes_list[0]
 
     results = []
     for i, ts in enumerate(timestamps):
@@ -149,6 +194,41 @@ def fetch_yahoo(stock_id: str, days: int) -> list:
     return results[-days:]
 
 
+def fetch_stock_data(stock_id: str, days: int) -> tuple[list, str]:
+    """
+    自動選擇資料來源。
+
+    先用已知上櫃清單決定優先順序；若清單沒有收錄，仍會在 TWSE 失敗後
+    自動 fallback 到 Yahoo .TWO，避免上櫃股漏查。
+    """
+    stock_id = normalize_stock_id(stock_id)
+
+    candidates = []
+    if is_otc(stock_id):
+        candidates.append(("Yahoo Finance (.TWO 上櫃)", lambda: fetch_yahoo(stock_id, days, "TWO")))
+        candidates.append(("TWSE 台灣證券交易所", lambda: fetch_twse(stock_id, days)))
+    else:
+        candidates.append(("TWSE 台灣證券交易所", lambda: fetch_twse(stock_id, days)))
+        candidates.append(("Yahoo Finance (.TWO 上櫃備援)", lambda: fetch_yahoo(stock_id, days, "TWO")))
+
+    candidates.append(("Yahoo Finance (.TW 上市備援)", lambda: fetch_yahoo(stock_id, days, "TW")))
+
+    errors = []
+    for source, fetcher in candidates:
+        try:
+            data = fetcher()
+        except Exception as e:
+            errors.append(f"{source}: {e}")
+            continue
+
+        if data:
+            return data, source
+
+        errors.append(f"{source}: 查無資料")
+
+    raise Exception("；".join(errors))
+
+
 # ========================================
 # MCP 工具 1：查詢單檔股價
 # ========================================
@@ -163,15 +243,11 @@ def stock_price(stock_id: str, days: int = 5) -> str:
 
     支援上市和上櫃股票。
     """
+    stock_id = normalize_stock_id(stock_id)
     days = min(max(days, 1), 30)
 
     try:
-        if is_otc(stock_id):
-            data = fetch_yahoo(stock_id, days)
-            source = "Yahoo Finance"
-        else:
-            data = fetch_twse(stock_id, days)
-            source = "TWSE 台灣證券交易所"
+        data, source = fetch_stock_data(stock_id, days)
     except Exception as e:
         return f"查詢失敗：{e}"
 
@@ -225,15 +301,16 @@ def stock_watchlist(stock_ids: str) -> str:
     參數：
     - stock_ids: 用逗號分隔的股票代碼，例如 "2330,1522,3580"
     """
-    codes = [c.strip() for c in stock_ids.split(",") if c.strip()]
+    codes = [
+        normalize_stock_id(c)
+        for c in stock_ids.split(",")
+        if c.strip()
+    ]
     results = []
 
     for code in codes:
         try:
-            if is_otc(code):
-                data = fetch_yahoo(code, 2)
-            else:
-                data = fetch_twse(code, 2)
+            data, source = fetch_stock_data(code, 2)
 
             if data:
                 latest = data[-1]
@@ -246,7 +323,7 @@ def stock_watchlist(stock_ids: str) -> str:
                     arrow = "[漲]" if diff > 0 else ("[跌]" if diff < 0 else "[平]")
                     change = f" {arrow}{sign}{diff:.2f}({sign}{pct:.1f}%)"
                 results.append(
-                    f"  {code}  {latest['close']:.2f}{change}"
+                    f"  {code}  {latest['close']:.2f}{change}  [{source}]"
                 )
             else:
                 results.append(f"  {code}  查無資料")
